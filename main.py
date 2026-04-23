@@ -3,7 +3,7 @@ import random
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from telegram import Update
@@ -19,16 +19,14 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения")
 
-# Разрешённый адрес вашего сайта (GitHub Pages)
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://ranTen.github.io")  # замените на свой
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://ranTen.github.io")
 
-# Хранилище кодов (простой словарь, для демо)
+# Хранилище кодов
 code_storage = {}
 
 # ---------- 2. FastAPI приложение ----------
 app = FastAPI()
 
-# CORS – чтобы ваш сайт мог вызывать API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGIN],
@@ -37,11 +35,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Модель запроса для проверки кода
 class CodeRequest(BaseModel):
     code: str
 
-# Эндпоинт для проверки кода (вызывается с сайта)
 @app.post("/verify")
 async def verify_code(request: CodeRequest):
     code = request.code.strip()
@@ -51,19 +47,17 @@ async def verify_code(request: CodeRequest):
     if datetime.now() > expire_time:
         code_storage.pop(code, None)
         raise HTTPException(status_code=400, detail="Код истек")
-    # Код верный – удаляем его (одноразовый) и возвращаем токен
     code_storage.pop(code, None)
     import uuid
     access_token = str(uuid.uuid4())
     logger.info(f"Успешная проверка кода {code}, выдан токен {access_token[:8]}...")
     return {"success": True, "token": access_token}
 
-# Эндпоинт для проверки работоспособности (health check)
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
-# ---------- 3. Telegram-бот (обработчики команд) ----------
+# ---------- 3. Telegram-бот (обработчики) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот для выдачи одноразовых кодов.\n"
@@ -80,7 +74,6 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Введите его на сайте для входа.",
         parse_mode="Markdown"
     )
-    # Автоматическое удаление через 10 минут
     asyncio.create_task(delete_code_after(code, 600))
 
 async def delete_code_after(code: str, delay: int):
@@ -88,49 +81,58 @@ async def delete_code_after(code: str, delay: int):
     code_storage.pop(code, None)
     logger.info(f"Код {code} удалён по истечении времени")
 
-# ---------- 4. Настройка вебхука для Telegram ----------
-async def setup_webhook(application: Application):
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not render_url:
-        logger.error("RENDER_EXTERNAL_URL не задан, вебхук не будет работать")
-        return False
-    webhook_path = "/webhook"
-    full_webhook_url = f"{render_url}{webhook_path}"
-    await application.bot.set_webhook(url=full_webhook_url)
-    logger.info(f"✅ Вебхук установлен на {full_webhook_url}")
-    return True
-
-# ---------- 5. Событие запуска FastAPI (инициализация бота и вебхука) ----------
-@app.on_event("startup")
-async def startup_event():
-    # Создаём приложение бота
+# ---------- 4. Инициализация бота и установка вебхука ----------
+async def init_bot() -> Application:
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("getcode", get_code))
-    
+    # Обязательная инициализация и запуск
+    await bot_app.initialize()
+    await bot_app.start()
     # Устанавливаем вебхук
-    success = await setup_webhook(bot_app)
-    if not success:
-        logger.warning("Вебхук не установлен, бот не будет получать обновления")
-    
-    # Сохраняем bot_app в состояние приложения, чтобы использовать в вебхуке
-    app.state.bot_app = bot_app
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if render_url:
+        webhook_path = "/webhook"
+        full_webhook_url = f"{render_url}{webhook_path}"
+        await bot_app.bot.set_webhook(url=full_webhook_url)
+        logger.info(f"✅ Вебхук установлен на {full_webhook_url}")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL не задан, вебхук не установлен")
+    return bot_app
 
-# ---------- 6. Эндпоинт для вебхука Telegram ----------
-from fastapi import Request
+# Глобальная переменная для бота
+bot_application = None
+
+@app.on_event("startup")
+async def startup_event():
+    global bot_application
+    bot_application = await init_bot()
+    logger.info("Бот инициализирован и готов принимать обновления")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global bot_application
+    if bot_application:
+        await bot_application.stop()
+        await bot_application.shutdown()
+        logger.info("Бот остановлен")
+
+# ---------- 5. Эндпоинт вебхука ----------
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    """Принимает обновления от Telegram и передаёт их боту."""
+    global bot_application
+    if not bot_application:
+        raise HTTPException(status_code=500, detail="Бот не инициализирован")
     try:
         data = await request.json()
-        update = Update.de_json(data, app.state.bot_app.bot)
-        await app.state.bot_app.process_update(update)
+        update = Update.de_json(data, bot_application.bot)
+        await bot_application.process_update(update)
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка обработки вебхука: {e}")
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal error")
 
-# ---------- 7. Точка входа (если запускаем файл напрямую) ----------
+# ---------- 6. Запуск (для локального тестирования) ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
