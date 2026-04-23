@@ -19,7 +19,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения")
 
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://ranTen.github.io")
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://ran1ten.github.io")
 
 # Хранилище кодов
 code_storage = {}
