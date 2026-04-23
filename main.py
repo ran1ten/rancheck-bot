@@ -13,7 +13,7 @@ app = FastAPI()
 
 # НАСТРОЙКИ - ОБЯЗАТЕЛЬНО измените!
 ALLOWED_ORIGIN = "https://ran1ten.github.io/ranCheck"  # <-- ССЫЛКА НА ВАШ САЙТ (без слеша в конце)
-BOT_TOKEN = os.getenv("8785747497:AAGcet1Lg_ReoRhoTdBxg_3nk3BeZHshdb8")  # Будет добавлено на Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Будет добавлено на Render
 
 # Локальное хранилище кодов (для демонстрации)
 codes_store = {}
