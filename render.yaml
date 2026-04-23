@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: rancheck-bot
+    runtime: python
+    repo: https://github.com/ran1ten/rancheck.git  # Замените на ваш репозиторий
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    
