@@ -14,10 +14,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import secrets
 
+# ==================== НАСТРОЙКИ ====================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- КОНФИГУРАЦИЯ ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан")
@@ -35,16 +35,15 @@ if ADMIN_USER_ID:
         ADMIN_USER_ID = int(ADMIN_USER_ID)
     except ValueError:
         ADMIN_USER_ID = None
-        logger.warning("ADMIN_USER_ID должен быть числом, админ-команды отключены")
+        logger.warning("ADMIN_USER_ID должен быть числом")
 else:
     ADMIN_USER_ID = None
-    logger.warning("ADMIN_USER_ID не задан, админ-команды отключены")
 
-# Опционально: включить whitelist (по умолчанию False)
 WHITELIST_ENABLED = os.environ.get("WHITELIST_ENABLED", "false").lower() == "true"
 
 DATABASE_URL = "logs.db"
 
+# ==================== БАЗА ДАННЫХ ====================
 def get_db():
     conn = sqlite3.connect(DATABASE_URL)
     conn.row_factory = sqlite3.Row
@@ -98,37 +97,40 @@ def log_web(ip: str, code: str, mods: str, resp: str):
         )
         conn.commit()
 
-# ---------- WHITELIST ФУНКЦИИ ----------
 def is_whitelisted(user_id: int) -> bool:
     if not WHITELIST_ENABLED:
-        return True  # если whitelist отключён, все пользователи имеют доступ
+        return True
     with get_db() as conn:
         row = conn.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,)).fetchone()
         return row is not None
 
-def add_to_whitelist(user_id: int, admin_id: int = None) -> bool:
-    with get_db() as conn:
-        try:
-            conn.execute("INSERT INTO whitelist (user_id, added_by) VALUES (?, ?)", (user_id, admin_id))
+def add_to_whitelist(user_id: int, added_by: int) -> bool:
+    try:
+        with get_db() as conn:
+            conn.execute("INSERT OR IGNORE INTO whitelist (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
             conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False  # уже есть
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка добавления в whitelist: {e}")
+        return False
 
 def remove_from_whitelist(user_id: int) -> bool:
-    with get_db() as conn:
-        cursor = conn.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
-        conn.commit()
-        return cursor.rowcount > 0
+    try:
+        with get_db() as conn:
+            conn.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка удаления из whitelist: {e}")
+        return False
 
-def get_whitelist() -> list:
+def get_whitelist():
     with get_db() as conn:
-        rows = conn.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at DESC").fetchall()
+        rows = conn.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at").fetchall()
         return [dict(row) for row in rows]
 
-# ---------- FASTAPI ПРИЛОЖЕНИЕ ----------
+# ==================== FASTAPI ====================
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGIN],
@@ -217,20 +219,16 @@ async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
             rows = conn.execute("SELECT * FROM web_logs ORDER BY timestamp DESC").fetchall()
     return [dict(row) for row in rows]
 
-# ---------- ТЕЛЕГРАМ БОТ ----------
+# ==================== ТЕЛЕГРАМ БОТ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    response = "👋 Привет! Я бот для выдачи одноразовых кодов.\n"
-    if WHITELIST_ENABLED and not is_whitelisted(user.id):
-        response += "❌ Доступ к генерации кодов ограничен. Обратитесь к администратору.\n"
-    else:
-        response += "✅ Напиши /getcode, чтобы получить код."
+    response = "👋 Привет! Я бот для выдачи одноразовых кодов.\nНапиши /getcode"
     await update.message.reply_text(response)
     log_telegram(user.id, user.username, "/start", response)
 
 async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_whitelisted(user.id):
+    if WHITELIST_ENABLED and not is_whitelisted(user.id):
         response = "❌ Вы не в белом списке. Доступ запрещён."
         await update.message.reply_text(response)
         log_telegram(user.id, user.username, "/getcode", response)
@@ -242,12 +240,11 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response, parse_mode="Markdown")
     log_telegram(user.id, user.username, "/getcode", response)
 
-# ---------- АДМИН-КОМАНДЫ ----------
+# ==================== АДМИН-КОМАНДЫ ====================
 def is_admin(update: Update) -> bool:
     if not ADMIN_USER_ID:
         return False
-    user = update.effective_user
-    return user.id == ADMIN_USER_ID
+    return update.effective_user.id == ADMIN_USER_ID
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -266,6 +263,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 Проверок модов на сайте: {web_checks}\n"
         f"✅ Успешных входов: {logins}\n"
         f"📋 В белом списке: {whitelist_count}\n"
+        f"⚙️ Режим whitelist: {'Включён' if WHITELIST_ENABLED else 'Выключен'}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -372,31 +370,42 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)
     await update.message.reply_text(f"Рассылка завершена: отправлено {sent}, ошибок {failed}.")
 
-# ---------- WHITELIST КОМАНДЫ АДМИНА ----------
+async def whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    users = get_whitelist()
+    if not users:
+        await update.message.reply_text("Белый список пуст.")
+        return
+    msg = "📋 **Белый список:**\n\n"
+    for u in users:
+        msg += f"• `{u['user_id']}` (добавлен {u['added_at']})\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 async def whitelist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
-        await update.message.reply_text("Укажите user_id: /whitelist add 123456789")
+        await update.message.reply_text("Укажите user_id: /whitelist_add 123456789")
         return
     try:
         uid = int(context.args[0])
     except ValueError:
         await update.message.reply_text("user_id должен быть числом.")
         return
-    if add_to_whitelist(uid, ADMIN_USER_ID):
-        await update.message.reply_text(f"✅ Пользователь {uid} добавлен в белый список.")
-        logger.info(f"Админ {ADMIN_USER_ID} добавил {uid} в whitelist")
+    if add_to_whitelist(uid, update.effective_user.id):
+        await update.message.reply_text(f"✅ Пользователь `{uid}` добавлен в белый список.", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ Пользователь {uid} уже в белом списке.")
+        await update.message.reply_text("❌ Ошибка при добавлении.")
 
 async def whitelist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
-        await update.message.reply_text("Укажите user_id: /whitelist remove 123456789")
+        await update.message.reply_text("Укажите user_id: /whitelist_remove 123456789")
         return
     try:
         uid = int(context.args[0])
@@ -404,31 +413,29 @@ async def whitelist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("user_id должен быть числом.")
         return
     if remove_from_whitelist(uid):
-        await update.message.reply_text(f"✅ Пользователь {uid} удалён из белого списка.")
-        logger.info(f"Админ {ADMIN_USER_ID} удалил {uid} из whitelist")
+        await update.message.reply_text(f"✅ Пользователь `{uid}` удалён из белого списка.", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ Пользователь {uid} не найден в белом списке.")
+        await update.message.reply_text("❌ Ошибка при удалении.")
 
-async def whitelist_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ Нет прав.")
         return
-    items = get_whitelist()
-    if not items:
-        await update.message.reply_text("Белый список пуст.")
-        return
-    msg = "📋 **Белый список пользователей:**\n\n"
-    for item in items:
-        msg += f"👤 ID: {item['user_id']}\n"
-        msg += f"➕ Добавлен: {item['added_at']}\n"
-        msg += f"━━━━━━━━━━━━━━━━━━\n"
-        if len(msg) > 3800:
-            await update.message.reply_text(msg)
-            msg = ""
-    if msg:
-        await update.message.reply_text(msg, parse_mode="Markdown")
+    msg = (
+        "🤖 **Доступные команды администратора:**\n\n"
+        "/stats – Статистика использования бота и сайта\n"
+        "/logs [N] – Последние N логов Telegram (по умолч. 10)\n"
+        "/web_logs [N] – Последние N логов сайта\n"
+        "/user_logs <ID> – Логи конкретного пользователя\n"
+        "/broadcast <текст> – Массовая рассылка всем пользователям\n"
+        "/whitelist – Показать белый список\n"
+        "/whitelist_add <ID> – Добавить пользователя в белый список\n"
+        "/whitelist_remove <ID> – Удалить из белого списка\n"
+        "/list – Показать это сообщение\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ---------- НАСТРОЙКА БОТА ----------
+# ==================== ВЕБХУК И ЗАПУСК ====================
 async def setup_webhook(application: Application):
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
@@ -456,13 +463,13 @@ async def startup():
         bot_app.add_handler(CommandHandler("web_logs", web_logs))
         bot_app.add_handler(CommandHandler("user_logs", user_logs))
         bot_app.add_handler(CommandHandler("broadcast", broadcast))
-        # Whitelist команды
-        bot_app.add_handler(CommandHandler("whitelist", whitelist_list))
+        bot_app.add_handler(CommandHandler("whitelist", whitelist_cmd))
         bot_app.add_handler(CommandHandler("whitelist_add", whitelist_add))
         bot_app.add_handler(CommandHandler("whitelist_remove", whitelist_remove))
+        bot_app.add_handler(CommandHandler("list", list_commands))
         logger.info(f"Админ-команды включены для user_id={ADMIN_USER_ID}")
     else:
-        logger.warning("Админ-команды отключены: ADMIN_USER_ID не задан")
+        logger.warning("Админ-команды отключены")
     await bot_app.initialize()
     await bot_app.start()
     await setup_webhook(bot_app)
