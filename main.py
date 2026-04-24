@@ -11,7 +11,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import secrets
 
 # ==================== НАСТРОЙКИ ====================
@@ -42,6 +42,7 @@ else:
 WHITELIST_ENABLED = os.environ.get("WHITELIST_ENABLED", "false").lower() == "true"
 
 DATABASE_URL = "logs.db"
+LOG_RETENTION_DAYS = 3  # хранить логи 3 дня
 
 # ==================== БАЗА ДАННЫХ ====================
 def get_db():
@@ -128,6 +129,22 @@ def get_whitelist():
     with get_db() as conn:
         rows = conn.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at").fetchall()
         return [dict(row) for row in rows]
+
+def clean_old_logs():
+    """Удаляет записи из telegram_logs старше LOG_RETENTION_DAYS дней"""
+    cutoff = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
+    with get_db() as conn:
+        result = conn.execute("DELETE FROM telegram_logs WHERE timestamp < ?", (cutoff,))
+        deleted = result.rowcount
+        conn.commit()
+    if deleted:
+        logger.info(f"Удалено {deleted} старых записей из telegram_logs (старше {LOG_RETENTION_DAYS} дней)")
+
+async def periodic_cleanup():
+    """Фоновая задача: запускает очистку логов раз в сутки"""
+    while True:
+        clean_old_logs()
+        await asyncio.sleep(86400)  # 24 часа
 
 # ==================== FASTAPI ====================
 app = FastAPI()
@@ -220,6 +237,25 @@ async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
     return [dict(row) for row in rows]
 
 # ==================== ТЕЛЕГРАМ БОТ ====================
+
+# Обработчик всех текстовых сообщений (логирование)
+async def log_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text if update.message else ""
+    # если это не команда (не начинается с '/') или команда не зарегистрирована,
+    # то отвечаем стандартным сообщением
+    if text.startswith('/'):
+        # Если команда не обработана другими хендлерами, сюда попадёт неизвестная команда
+        response = "❌ Неизвестная команда. Используйте /start, /getcode."
+        await update.message.reply_text(response)
+        log_telegram(user.id, user.username, text, response)
+    else:
+        # На обычные сообщения тоже логируем, но не отвечаем (или отвечаем стандартно)
+        response = "Используйте /getcode для получения кода."
+        await update.message.reply_text(response)
+        log_telegram(user.id, user.username, text, response)
+
+# Основные команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     response = "👋 Привет! Я бот для выдачи одноразовых кодов.\nНапиши /getcode"
@@ -240,7 +276,7 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response, parse_mode="Markdown")
     log_telegram(user.id, user.username, "/getcode", response)
 
-# ==================== АДМИН-КОМАНДЫ ====================
+# Админ-команды
 def is_admin(update: Update) -> bool:
     if not ADMIN_USER_ID:
         return False
@@ -266,6 +302,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ Режим whitelist: {'Включён' if WHITELIST_ENABLED else 'Выключен'}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/stats", msg)
 
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -290,6 +327,7 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = ""
     if msg:
         await update.message.reply_text(msg, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/logs", "OK")
 
 async def web_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -314,6 +352,7 @@ async def web_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = ""
     if msg:
         await update.message.reply_text(msg, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/web_logs", "OK")
 
 async def user_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -343,6 +382,7 @@ async def user_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = ""
     if msg:
         await update.message.reply_text(msg, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/user_logs", "OK")
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -368,7 +408,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Не удалось отправить {uid}: {e}")
             failed += 1
         await asyncio.sleep(0.05)
-    await update.message.reply_text(f"Рассылка завершена: отправлено {sent}, ошибок {failed}.")
+    resp = f"Рассылка завершена: отправлено {sent}, ошибок {failed}."
+    await update.message.reply_text(resp)
+    log_telegram(update.effective_user.id, update.effective_user.username, "/broadcast", resp)
 
 async def whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -382,6 +424,7 @@ async def whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u in users:
         msg += f"• `{u['user_id']}` (добавлен {u['added_at']})\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/whitelist", "OK")
 
 async def whitelist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -396,9 +439,11 @@ async def whitelist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("user_id должен быть числом.")
         return
     if add_to_whitelist(uid, update.effective_user.id):
-        await update.message.reply_text(f"✅ Пользователь `{uid}` добавлен в белый список.", parse_mode="Markdown")
+        resp = f"✅ Пользователь `{uid}` добавлен в белый список."
     else:
-        await update.message.reply_text("❌ Ошибка при добавлении.")
+        resp = "❌ Ошибка при добавлении."
+    await update.message.reply_text(resp, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/whitelist_add", resp)
 
 async def whitelist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -413,9 +458,11 @@ async def whitelist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("user_id должен быть числом.")
         return
     if remove_from_whitelist(uid):
-        await update.message.reply_text(f"✅ Пользователь `{uid}` удалён из белого списка.", parse_mode="Markdown")
+        resp = f"✅ Пользователь `{uid}` удалён из белого списка."
     else:
-        await update.message.reply_text("❌ Ошибка при удалении.")
+        resp = "❌ Ошибка при удалении."
+    await update.message.reply_text(resp, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/whitelist_remove", resp)
 
 async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -434,6 +481,7 @@ async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list – Показать это сообщение\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+    log_telegram(update.effective_user.id, update.effective_user.username, "/list", "OK")
 
 # ==================== ВЕБХУК И ЗАПУСК ====================
 async def setup_webhook(application: Application):
@@ -452,6 +500,11 @@ bot_app = None
 async def startup():
     global bot_app
     init_db()
+    # Запускаем фоновую задачу очистки логов
+    asyncio.create_task(periodic_cleanup())
+    # Сразу один раз почистим при старте
+    clean_old_logs()
+
     bot_app = Application.builder().token(BOT_TOKEN).build()
     # Общие команды
     bot_app.add_handler(CommandHandler("start", start))
@@ -470,6 +523,11 @@ async def startup():
         logger.info(f"Админ-команды включены для user_id={ADMIN_USER_ID}")
     else:
         logger.warning("Админ-команды отключены")
+    # Обработчик всех остальных сообщений (логирование + ответ)
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_all_messages))
+    # Для команд, которые не попали в другие хендлеры, тоже логируем
+    bot_app.add_handler(MessageHandler(filters.COMMAND, log_all_messages))
+
     await bot_app.initialize()
     await bot_app.start()
     await setup_webhook(bot_app)
