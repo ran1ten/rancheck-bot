@@ -4,11 +4,14 @@ import logging
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+import secrets
 
 # ---------- 1. НАСТРОЙКА ЛОГИРОВАНИЯ ----------
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +24,12 @@ if not BOT_TOKEN:
 
 # Адрес вашего сайта на GitHub Pages (БЕЗ слеша в конце!)
 ALLOWED_ORIGIN = "https://ran1ten.github.io"
+
+# Данные для входа в админ-панель (установите на Render)
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+if not ADMIN_PASSWORD:
+    raise ValueError("ADMIN_PASSWORD не задан в переменных окружения")
 
 # ---------- 3. ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ----------
 DATABASE_URL = "logs.db"
@@ -76,7 +85,7 @@ def log_web(ip: str, code: str, mods: str, resp: str):
 # ---------- 4. FASTAPI ПРИЛОЖЕНИЕ ----------
 app = FastAPI()
 
-# CORS – разрешаем запросы с вашего сайта
+# CORS – разрешаем запросы с вашего сайта и с админки (будет отдаваться с сервера)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGIN],
@@ -84,6 +93,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# HTTP Basic Auth для админки
+security = HTTPBasic()
+
+def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    is_username_ok = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
+    is_password_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (is_username_ok and is_password_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return True
 
 # Хранилище одноразовых кодов
 code_storage = {}
@@ -113,7 +136,6 @@ async def verify_code(request: CodeRequest, req: Request):
         log_web(client_ip, code, "", "Код истек")
         raise HTTPException(400, detail="Код истек")
 
-    # Код верный – удаляем и выдаём токен
     code_storage.pop(code, None)
     token = str(uuid.uuid4())
     log_web(client_ip, code, "", "Доступ разрешён")
@@ -125,7 +147,7 @@ async def health():
 
 @app.post("/api/log-web-action")
 async def log_web_action(log: WebActionLog, req: Request):
-    """Принимает логи с сайта о проверке модов"""
+    """Принимает логи с сайта о проверке модов (без авторизации)"""
     client_ip = req.client.host
     with get_db() as conn:
         conn.execute(
@@ -135,9 +157,19 @@ async def log_web_action(log: WebActionLog, req: Request):
         conn.commit()
     return {"status": "ok"}
 
-# ---------- API ДЛЯ АДМИН-ПАНЕЛИ ----------
+# ---------- ЗАЩИЩЁННЫЕ ЭНДПОИНТЫ ДЛЯ АДМИНКИ ----------
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_panel(auth: bool = Depends(verify_auth)):
+    """Отдаёт HTML-страницу админ-панели (требует логин/пароль)"""
+    try:
+        with open("admin.html", "r", encoding="utf-8") as f:
+            html_content = f.read()
+        return HTMLResponse(content=html_content)
+    except FileNotFoundError:
+        raise HTTPException(500, "Файл admin.html не найден на сервере")
+
 @app.get("/api/telegram-logs")
-async def get_telegram_logs(user_id: int = None, username: str = None):
+async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = None, username: str = None):
     with get_db() as conn:
         query = "SELECT * FROM telegram_logs"
         params = []
@@ -152,7 +184,7 @@ async def get_telegram_logs(user_id: int = None, username: str = None):
     return [dict(row) for row in rows]
 
 @app.get("/api/web-logs")
-async def get_web_logs(ip: str = None):
+async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
     with get_db() as conn:
         if ip:
             rows = conn.execute("SELECT * FROM web_logs WHERE ip_address = ? ORDER BY timestamp DESC", (ip,)).fetchall()
@@ -195,7 +227,6 @@ bot_app = None
 async def startup():
     global bot_app
     init_db()
-    # Создаём и инициализируем бота
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("getcode", get_code))
