@@ -92,6 +92,11 @@ code_storage = {}
 class CodeRequest(BaseModel):
     code: str
 
+# Модель для логов с сайта
+class WebActionLog(BaseModel):
+    mod_name: str
+    verdict: str
+
 # ---------- 5. ЭНДПОИНТЫ API ----------
 
 @app.post("/verify")
@@ -116,6 +121,18 @@ async def verify_code(request: CodeRequest, req: Request):
 
 @app.get("/health")
 async def health():
+    return {"status": "ok"}
+
+@app.post("/api/log-web-action")
+async def log_web_action(log: WebActionLog, req: Request):
+    """Принимает логи с сайта о проверке модов"""
+    client_ip = req.client.host
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (client_ip, "", f"{log.mod_name} -> {log.verdict}", "OK", datetime.now())
+        )
+        conn.commit()
     return {"status": "ok"}
 
 # ---------- API ДЛЯ АДМИН-ПАНЕЛИ ----------
