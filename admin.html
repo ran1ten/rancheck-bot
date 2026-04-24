@@ -5,11 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin Panel - ranCheck</title>
     <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         body {
             font-family: system-ui, 'Segoe UI', monospace;
             background: #1a1e2b;
             color: white;
             padding: 20px;
+        }
+        h1 {
+            margin-bottom: 20px;
         }
         .tabs {
             display: flex;
@@ -23,6 +31,7 @@
             border-radius: 20px;
             color: white;
             cursor: pointer;
+            transition: 0.2s;
         }
         .tab-button.active {
             background: #4c9aff;
@@ -33,20 +42,12 @@
         .tab-content.active {
             display: block;
         }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: #0f1219;
-            border-radius: 16px;
-            overflow: hidden;
-        }
-        th, td {
-            padding: 8px 12px;
-            text-align: left;
-            border-bottom: 1px solid #2a2f3f;
-        }
-        th {
-            background: #4c9aff;
+        .search-container {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
         }
         input {
             background: #0f1219;
@@ -54,13 +55,7 @@
             border-radius: 20px;
             padding: 8px 16px;
             color: white;
-            margin-bottom: 15px;
-            width: 300px;
-        }
-        .search-container {
-            display: flex;
-            gap: 10px;
-            align-items: center;
+            min-width: 250px;
         }
         button {
             background: #4c9aff;
@@ -69,6 +64,39 @@
             padding: 8px 16px;
             color: white;
             cursor: pointer;
+        }
+        .table-wrapper {
+            overflow-x: auto;
+            max-height: 70vh;
+            border-radius: 16px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #0f1219;
+            min-width: 600px;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid #2a2f3f;
+            vertical-align: top;
+            word-break: break-word;
+            white-space: normal;
+        }
+        th {
+            background: #4c9aff;
+            position: sticky;
+            top: 0;
+        }
+        td {
+            font-family: monospace;
+            font-size: 0.85rem;
+        }
+        .no-data {
+            text-align: center;
+            padding: 20px;
+            color: #aaa;
         }
     </style>
 </head>
@@ -86,12 +114,16 @@
             <button id="tgSearchBtn">🔍 Найти</button>
             <button id="tgResetBtn">🔄 Сброс</button>
         </div>
-        <table>
-            <thead>
-                <tr><th>ID</th><th>Username</th><th>Сообщение</th><th>Ответ бота</th><th>Время</th></tr>
-            </thead>
-            <tbody id="tgLogsBody"></tbody>
-        </table>
+        <div class="table-wrapper">
+            <table id="telegramTable">
+                <thead>
+                    <tr><th>User ID</th><th>Username</th><th>Сообщение</th><th>Ответ бота</th><th>Время</th></tr>
+                </thead>
+                <tbody id="tgLogsBody">
+                    <tr><td colspan="5" class="no-data">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <div id="web" class="tab-content">
@@ -101,63 +133,85 @@
             <button id="webSearchBtn">🔍 Найти</button>
             <button id="webResetBtn">🔄 Сброс</button>
         </div>
-        <table>
-            <thead>
-                <tr><th>IP</th><th>Введённый код</th><th>Загруженные моды</th><th>Ответ сайта</th><th>Время</th></tr>
-            </thead>
-            <tbody id="webLogsBody"></tbody>
-        </table>
+        <div class="table-wrapper">
+            <table id="webTable">
+                <thead>
+                    <tr><th>IP</th><th>Введённый код</th><th>Загруженные моды</th><th>Ответ сайта</th><th>Время</th></tr>
+                </thead>
+                <tbody id="webLogsBody">
+                    <tr><td colspan="5" class="no-data">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <script>
-        const API_BASE = "";  // пустой, так как страница загружена с того же сервера
+        const API_BASE = "";  // текущий сервер
 
         async function loadTelegramLogs(search = '') {
-            let url = `${API_BASE}/api/telegram-logs`;
+            let url = `/api/telegram-logs`;
             if (search) {
                 if (/^\d+$/.test(search)) url += `?user_id=${search}`;
                 else url += `?username=${search}`;
             }
-            const response = await fetch(url, { credentials: 'include' });
-            if (response.status === 401) {
-                alert("Требуется авторизация. Обновите страницу и введите логин/пароль.");
-                return;
-            }
-            const data = await response.json();
-            const tbody = document.getElementById('tgLogsBody');
-            tbody.innerHTML = '';
-            for (const log of data) {
-                const row = `<tr>
-                    <tr>${log.user_id}</td>
-                    <td>${log.username || '—'}</td>
-                    <td>${escapeHtml(log.message)}</td>
-                    <｜point｜>${escapeHtml(log.bot_response)}</td>
-                    <td>${new Date(log.timestamp).toLocaleString()}</td>
-                </tr>`;
-                tbody.insertAdjacentHTML('beforeend', row);
+            try {
+                const response = await fetch(url, { credentials: 'include' });
+                if (response.status === 401) {
+                    alert("Требуется авторизация. Обновите страницу и введите логин/пароль.");
+                    return;
+                }
+                const data = await response.json();
+                const tbody = document.getElementById('tgLogsBody');
+                if (!data.length) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="no-data">Нет записей</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = '';
+                for (const log of data) {
+                    const row = `<tr>
+                        <td>${log.user_id}</td>
+                        <td>${escapeHtml(log.username || '—')}</td>
+                        <td>${escapeHtml(log.message)}</td>
+                        <td>${escapeHtml(log.bot_response)}</td>
+                        <td>${new Date(log.timestamp).toLocaleString()}</td>
+                    </tr>`;
+                    tbody.insertAdjacentHTML('beforeend', row);
+                }
+            } catch(e) {
+                console.error(e);
+                document.getElementById('tgLogsBody').innerHTML = '<tr><td colspan="5" class="no-data">Ошибка загрузки</td></tr>';
             }
         }
 
         async function loadWebLogs(ip = '') {
-            let url = `${API_BASE}/api/web-logs`;
+            let url = `/api/web-logs`;
             if (ip) url += `?ip=${ip}`;
-            const response = await fetch(url, { credentials: 'include' });
-            if (response.status === 401) {
-                alert("Требуется авторизация.");
-                return;
-            }
-            const data = await response.json();
-            const tbody = document.getElementById('webLogsBody');
-            tbody.innerHTML = '';
-            for (const log of data) {
-                const row = `<tr>
-                    <td>${log.ip_address || '—'}</td>
-                    <td>${log.entered_code}</td>
-                    <td>${escapeHtml(log.uploaded_mods || '—')}</td>
-                    <td>${escapeHtml(log.site_response)}</td>
-                    <td>${new Date(log.timestamp).toLocaleString()}</td>
-                </tr>`;
-                tbody.insertAdjacentHTML('beforeend', row);
+            try {
+                const response = await fetch(url, { credentials: 'include' });
+                if (response.status === 401) {
+                    alert("Требуется авторизация.");
+                    return;
+                }
+                const data = await response.json();
+                const tbody = document.getElementById('webLogsBody');
+                if (!data.length) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="no-data">Нет записей</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = '';
+                for (const log of data) {
+                    const row = `<tr>
+                        <td>${escapeHtml(log.ip_address || '—')}</td>
+                        <td>${escapeHtml(log.entered_code)}</td>
+                        <td>${escapeHtml(log.uploaded_mods || '—')}</td>
+                        <td>${escapeHtml(log.site_response)}</td>
+                        <td>${new Date(log.timestamp).toLocaleString()}</td>
+                    </tr>`;
+                    tbody.insertAdjacentHTML('beforeend', row);
+                }
+            } catch(e) {
+                console.error(e);
+                document.getElementById('webLogsBody').innerHTML = '<tr><td colspan="5" class="no-data">Ошибка загрузки</td></tr>';
             }
         }
 
@@ -171,7 +225,6 @@
             });
         }
 
-        // Вкладки
         document.querySelectorAll('.tab-button').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
@@ -182,7 +235,6 @@
             });
         });
 
-        // Поиск
         document.getElementById('tgSearchBtn').addEventListener('click', () => {
             loadTelegramLogs(document.getElementById('tgSearch').value.trim());
         });
@@ -198,7 +250,6 @@
             loadWebLogs();
         });
 
-        // Загрузка при старте
         loadTelegramLogs();
         loadWebLogs();
     </script>
