@@ -25,13 +25,13 @@ if not BOT_TOKEN:
 # Адрес вашего сайта на GitHub Pages (БЕЗ слеша в конце!)
 ALLOWED_ORIGIN = "https://ran1ten.github.io"
 
-# Данные для входа в админ-панель (установите на Render)
+# Данные для входа в админ-панель (обязательно задайте на Render)
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
     raise ValueError("ADMIN_PASSWORD не задан в переменных окружения")
 
-# ---------- 3. ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ----------
+# ---------- 3. БАЗА ДАННЫХ ----------
 DATABASE_URL = "logs.db"
 
 def get_db():
@@ -40,7 +40,6 @@ def get_db():
     return conn
 
 def init_db():
-    """Создаёт таблицы, если их нет. Вызывается при старте приложения."""
     with get_db() as conn:
         conn.execute('''
         CREATE TABLE IF NOT EXISTS telegram_logs (
@@ -65,7 +64,6 @@ def init_db():
         conn.commit()
     logger.info("База данных инициализирована")
 
-# Функции логирования
 def log_telegram(user_id: int, username: str, msg: str, bot_resp: str):
     with get_db() as conn:
         conn.execute(
@@ -85,7 +83,6 @@ def log_web(ip: str, code: str, mods: str, resp: str):
 # ---------- 4. FASTAPI ПРИЛОЖЕНИЕ ----------
 app = FastAPI()
 
-# CORS – разрешаем запросы с вашего сайта и с админки (будет отдаваться с сервера)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGIN],
@@ -94,7 +91,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HTTP Basic Auth для админки
+# HTTP Basic Auth
 security = HTTPBasic()
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -108,19 +105,17 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return True
 
-# Хранилище одноразовых кодов
+# Хранилище кодов
 code_storage = {}
 
-# Модель запроса для проверки кода
 class CodeRequest(BaseModel):
     code: str
 
-# Модель для логов с сайта
 class WebActionLog(BaseModel):
     mod_name: str
     verdict: str
 
-# ---------- 5. ЭНДПОИНТЫ API ----------
+# ---------- 5. ЭНДПОИНТЫ ----------
 
 @app.post("/verify")
 async def verify_code(request: CodeRequest, req: Request):
@@ -147,7 +142,6 @@ async def health():
 
 @app.post("/api/log-web-action")
 async def log_web_action(log: WebActionLog, req: Request):
-    """Принимает логи с сайта о проверке модов (без авторизации)"""
     client_ip = req.client.host
     with get_db() as conn:
         conn.execute(
@@ -157,10 +151,9 @@ async def log_web_action(log: WebActionLog, req: Request):
         conn.commit()
     return {"status": "ok"}
 
-# ---------- ЗАЩИЩЁННЫЕ ЭНДПОИНТЫ ДЛЯ АДМИНКИ ----------
+# ---------- ЗАЩИЩЁННЫЕ ЭНДПОИНТЫ (админка) ----------
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(auth: bool = Depends(verify_auth)):
-    """Отдаёт HTML-страницу админ-панели (требует логин/пароль)"""
     try:
         with open("admin.html", "r", encoding="utf-8") as f:
             html_content = f.read()
@@ -208,7 +201,6 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response, parse_mode="Markdown")
     log_telegram(user.id, user.username, "/getcode", response)
 
-# Функция для установки вебхука при старте
 async def setup_webhook(application: Application):
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
@@ -220,7 +212,6 @@ async def setup_webhook(application: Application):
     logger.info(f"✅ Вебхук установлен на {full_url}")
     return True
 
-# Глобальная переменная для бота
 bot_app = None
 
 @app.on_event("startup")
@@ -233,7 +224,7 @@ async def startup():
     await bot_app.initialize()
     await bot_app.start()
     await setup_webhook(bot_app)
-    logger.info("Бот запущен и готов принимать сообщения")
+    logger.info("Бот запущен")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -243,7 +234,6 @@ async def shutdown():
         await bot_app.shutdown()
         logger.info("Бот остановлен")
 
-# Эндпоинт для вебхука Telegram
 @app.post("/webhook")
 async def webhook(request: Request):
     global bot_app
@@ -258,7 +248,7 @@ async def webhook(request: Request):
         logger.error(f"Ошибка вебхука: {e}", exc_info=True)
         raise HTTPException(500, "Internal error")
 
-# ---------- 7. ТОЧКА ВХОДА ДЛЯ UVICORN ----------
+# ---------- 7. ЗАПУСК ----------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
