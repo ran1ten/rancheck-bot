@@ -22,10 +22,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения")
 
-# Адрес вашего сайта на GitHub Pages (БЕЗ слеша в конце!)
+# Адрес вашего сайта на GitHub Pages (БЕЗ слеша в конце)
 ALLOWED_ORIGIN = "https://ran1ten.github.io"
 
-# Данные для входа в админ-панель (обязательно задайте на Render)
+# Данные для входа в админ-панель (обязательно задать на Render)
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
@@ -116,7 +116,6 @@ class WebActionLog(BaseModel):
     verdict: str
 
 # ---------- 5. ЭНДПОИНТЫ ----------
-
 @app.post("/verify")
 async def verify_code(request: CodeRequest, req: Request):
     client_ip = req.client.host
