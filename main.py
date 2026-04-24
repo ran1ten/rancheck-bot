@@ -13,25 +13,33 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import secrets
 
-# ---------- 1. НАСТРОЙКА ЛОГИРОВАНИЯ ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- 2. КОНФИГУРАЦИЯ ----------
+# ---------- 1. КОНФИГУРАЦИЯ ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения")
+    raise ValueError("BOT_TOKEN не задан")
 
-# Адрес вашего сайта на GitHub Pages (БЕЗ слеша в конце)
 ALLOWED_ORIGIN = "https://ran1ten.github.io"
 
-# Данные для входа в админ-панель (обязательно задать на Render)
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
-    raise ValueError("ADMIN_PASSWORD не задан в переменных окружения")
+    raise ValueError("ADMIN_PASSWORD не задан")
 
-# ---------- 3. БАЗА ДАННЫХ ----------
+# ID администратора Telegram (число)
+ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")
+if ADMIN_USER_ID:
+    try:
+        ADMIN_USER_ID = int(ADMIN_USER_ID)
+    except ValueError:
+        ADMIN_USER_ID = None
+        logger.warning("ADMIN_USER_ID должен быть числом, админ-команды отключены")
+else:
+    ADMIN_USER_ID = None
+    logger.warning("ADMIN_USER_ID не задан, админ-команды отключены")
+
 DATABASE_URL = "logs.db"
 
 def get_db():
@@ -80,7 +88,7 @@ def log_web(ip: str, code: str, mods: str, resp: str):
         )
         conn.commit()
 
-# ---------- 4. FASTAPI ПРИЛОЖЕНИЕ ----------
+# ---------- 2. FASTAPI ПРИЛОЖЕНИЕ ----------
 app = FastAPI()
 
 app.add_middleware(
@@ -91,21 +99,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HTTP Basic Auth
 security = HTTPBasic()
-
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    is_username_ok = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
-    is_password_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
-    if not (is_username_ok and is_password_ok):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+    if not (secrets.compare_digest(credentials.username, ADMIN_USERNAME) and
+            secrets.compare_digest(credentials.password, ADMIN_PASSWORD)):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
-# Хранилище кодов
 code_storage = {}
 
 class CodeRequest(BaseModel):
@@ -115,12 +115,10 @@ class WebActionLog(BaseModel):
     mod_name: str
     verdict: str
 
-# ---------- 5. ЭНДПОИНТЫ ----------
 @app.post("/verify")
 async def verify_code(request: CodeRequest, req: Request):
     client_ip = req.client.host
     code = request.code.strip()
-
     expire = code_storage.get(code)
     if not expire:
         log_web(client_ip, code, "", "Неверный или просроченный код")
@@ -129,7 +127,6 @@ async def verify_code(request: CodeRequest, req: Request):
         code_storage.pop(code, None)
         log_web(client_ip, code, "", "Код истек")
         raise HTTPException(400, detail="Код истек")
-
     code_storage.pop(code, None)
     token = str(uuid.uuid4())
     log_web(client_ip, code, "", "Доступ разрешён")
@@ -150,15 +147,13 @@ async def log_web_action(log: WebActionLog, req: Request):
         conn.commit()
     return {"status": "ok"}
 
-# ---------- ЗАЩИЩЁННЫЕ ЭНДПОИНТЫ (админка) ----------
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(auth: bool = Depends(verify_auth)):
     try:
         with open("admin.html", "r", encoding="utf-8") as f:
-            html_content = f.read()
-        return HTMLResponse(content=html_content)
+            return HTMLResponse(content=f.read())
     except FileNotFoundError:
-        raise HTTPException(500, "Файл admin.html не найден на сервере")
+        raise HTTPException(500, "admin.html not found")
 
 @app.get("/api/telegram-logs")
 async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = None, username: str = None):
@@ -184,7 +179,7 @@ async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
             rows = conn.execute("SELECT * FROM web_logs ORDER BY timestamp DESC").fetchall()
     return [dict(row) for row in rows]
 
-# ---------- 6. TELEGRAM БОТ ----------
+# ---------- 3. ТЕЛЕГРАМ БОТ (ОБЩИЕ КОМАНДЫ) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     response = "👋 Привет! Я бот для выдачи одноразовых кодов.\nНапиши /getcode"
@@ -200,15 +195,149 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response, parse_mode="Markdown")
     log_telegram(user.id, user.username, "/getcode", response)
 
+# ---------- 4. АДМИН-КОМАНДЫ (только для ADMIN_USER_ID) ----------
+def is_admin(update: Update) -> bool:
+    if not ADMIN_USER_ID:
+        return False
+    user = update.effective_user
+    return user.id == ADMIN_USER_ID
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ У вас нет прав для этой команды.")
+        return
+    with get_db() as conn:
+        # количество уникальных пользователей в телеграме
+        users_count = conn.execute("SELECT COUNT(DISTINCT user_id) FROM telegram_logs").fetchone()[0]
+        # количество выданных кодов (записей /getcode)
+        codes_count = conn.execute("SELECT COUNT(*) FROM telegram_logs WHERE message = '/getcode'").fetchone()[0]
+        # количество проверок на сайте (записей в web_logs)
+        web_checks = conn.execute("SELECT COUNT(*) FROM web_logs WHERE uploaded_mods != ''").fetchone()[0]
+        # количество входов (success)
+        logins = conn.execute("SELECT COUNT(*) FROM web_logs WHERE site_response = 'Доступ разрешён'").fetchone()[0]
+    msg = (
+        f"📊 **Статистика**\n"
+        f"👥 Пользователей в Telegram: {users_count}\n"
+        f"🔑 Выдано кодов: {codes_count}\n"
+        f"🌐 Проверок модов на сайте: {web_checks}\n"
+        f"✅ Успешных входов: {logins}\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    # количество строк: /logs 15 (по умолчанию 10)
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = int(context.args[0])
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT timestamp, user_id, username, message, bot_response FROM telegram_logs ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Логов нет.")
+        return
+    msg = "📜 **Последние логи Telegram:**\n\n"
+    for row in rows:
+        msg += f"🕒 {row['timestamp']}\n👤 {row['user_id']} (@{row['username'] or '?'})\n💬 {row['message']}\n🤖 {row['bot_response'][:100]}\n\n"
+        if len(msg) > 3800:
+            await update.message.reply_text(msg)
+            msg = ""
+    if msg:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def web_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = int(context.args[0])
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT timestamp, ip_address, entered_code, uploaded_mods, site_response FROM web_logs ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Логов сайта нет.")
+        return
+    msg = "🌐 **Последние логи сайта:**\n\n"
+    for row in rows:
+        msg += f"🕒 {row['timestamp']}\n🌍 IP: {row['ip_address']}\n🔑 Код: {row['entered_code']}\n📦 Моды: {row['uploaded_mods'][:80]}\n📝 Ответ: {row['site_response']}\n\n"
+        if len(msg) > 3800:
+            await update.message.reply_text(msg)
+            msg = ""
+    if msg:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def user_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажите user_id: /user_logs 123456789")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT timestamp, message, bot_response FROM telegram_logs WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20",
+            (uid,)
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text(f"Логов для пользователя {uid} не найдено.")
+        return
+    msg = f"📄 **Логи пользователя {uid}:**\n\n"
+    for row in rows:
+        msg += f"🕒 {row['timestamp']}\n💬 {row['message']}\n🤖 {row['bot_response'][:100]}\n\n"
+        if len(msg) > 3800:
+            await update.message.reply_text(msg)
+            msg = ""
+    if msg:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажите текст рассылки после команды.")
+        return
+    text = " ".join(context.args)
+    # получить всех уникальных пользователей
+    with get_db() as conn:
+        users = conn.execute("SELECT DISTINCT user_id FROM telegram_logs").fetchall()
+    if not users:
+        await update.message.reply_text("Нет пользователей для рассылки.")
+        return
+    sent = 0
+    failed = 0
+    for row in users:
+        uid = row['user_id']
+        try:
+            await context.bot.send_message(chat_id=uid, text=f"📢 **Объявление от администратора:**\n{text}", parse_mode="Markdown")
+            sent += 1
+        except Exception as e:
+            logger.error(f"Не удалось отправить {uid}: {e}")
+            failed += 1
+        await asyncio.sleep(0.05)  # задержка, чтобы не забанили
+    await update.message.reply_text(f"Рассылка завершена: отправлено {sent}, ошибок {failed}.")
+
+# ---------- 5. НАСТРОЙКА БОТА ----------
 async def setup_webhook(application: Application):
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
-        logger.error("RENDER_EXTERNAL_URL не задан, вебхук не будет работать")
+        logger.error("RENDER_EXTERNAL_URL не задан")
         return False
-    webhook_path = "/webhook"
-    full_url = f"{render_url}{webhook_path}"
+    full_url = f"{render_url}/webhook"
     await application.bot.set_webhook(url=full_url)
-    logger.info(f"✅ Вебхук установлен на {full_url}")
+    logger.info(f"Вебхук установлен на {full_url}")
     return True
 
 bot_app = None
@@ -218,8 +347,19 @@ async def startup():
     global bot_app
     init_db()
     bot_app = Application.builder().token(BOT_TOKEN).build()
+    # Общие команды
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("getcode", get_code))
+    # Админ-команды
+    if ADMIN_USER_ID:
+        bot_app.add_handler(CommandHandler("stats", stats))
+        bot_app.add_handler(CommandHandler("logs", logs))
+        bot_app.add_handler(CommandHandler("web_logs", web_logs))
+        bot_app.add_handler(CommandHandler("user_logs", user_logs))
+        bot_app.add_handler(CommandHandler("broadcast", broadcast))
+        logger.info(f"Админ-команды включены для user_id={ADMIN_USER_ID}")
+    else:
+        logger.warning("Админ-команды отключены: ADMIN_USER_ID не задан")
     await bot_app.initialize()
     await bot_app.start()
     await setup_webhook(bot_app)
@@ -237,18 +377,18 @@ async def shutdown():
 async def webhook(request: Request):
     global bot_app
     if not bot_app:
-        raise HTTPException(500, "Бот не инициализирован")
+        raise HTTPException(500, "Bot not initialized")
     try:
         data = await request.json()
         update = Update.de_json(data, bot_app.bot)
         await bot_app.process_update(update)
         return {"ok": True}
     except Exception as e:
-        logger.error(f"Ошибка вебхука: {e}", exc_info=True)
+        logger.error(f"Webhook error: {e}", exc_info=True)
         raise HTTPException(500, "Internal error")
 
-# ---------- 7. ЗАПУСК ----------
 if __name__ == "__main__":
     import uvicorn
+    import asyncio
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
