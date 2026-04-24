@@ -3,3 +3,4 @@ uvicorn
 python-telegram-bot==20.7
 pydantic
 python-multipart
+python-3.11
