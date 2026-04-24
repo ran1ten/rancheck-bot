@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-python-telegram-bot==20.7
+python-telegram-bot
 pydantic
 python-multipart
 python-3.11
