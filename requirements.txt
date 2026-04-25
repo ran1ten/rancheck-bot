@@ -3,3 +3,4 @@ uvicorn
 python-telegram-bot>=21.10
 pydantic
 python-multipart
+psycopg2-binary
