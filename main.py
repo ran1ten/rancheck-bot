@@ -782,7 +782,7 @@ async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет прав.")
         return
     msg = (
-        "🤖 **Доступные команды администратора:**\n\n"
+        "🤖 Доступные команды администратора:\n\n"
         "/stats – Статистика\n"
         "/logs [N] – Последние N логов Telegram\n"
         "/web_logs [N] – Последние N логов сайта\n"
@@ -794,9 +794,9 @@ async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/make_moderator <ID> – Назначить модератора (только админ)\n"
         "/remove_moderator <ID> – Удалить модератора (только админ)\n"
         "/list_moderators – Список модераторов (только админ)\n"
-        "/list – Это сообщение\n"
+        "/list – Это сообщение"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg)  # без parse_mode
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
