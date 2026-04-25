@@ -1,6 +1,7 @@
 import os
 import random
 import logging
+import sqlite3
 import uuid
 import asyncio
 from datetime import datetime, timedelta
@@ -13,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import secrets
 
-# PostgreSQL поддержка (если доступен psycopg2 и задана DATABASE_URL)
+# PostgreSQL support
 try:
     import psycopg2
     from psycopg2 import pool
@@ -21,21 +22,20 @@ try:
 except ImportError:
     PSYCOPG2_AVAILABLE = False
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Конфигурация из переменных окружения ----------
+# ---------- Env variables ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан")
+    raise ValueError("BOT_TOKEN not set")
 
 ALLOWED_ORIGIN = "https://ran1ten.github.io"
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
-    raise ValueError("ADMIN_PASSWORD не задан")
+    raise ValueError("ADMIN_PASSWORD not set")
 
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")
 if ADMIN_USER_ID:
@@ -43,13 +43,12 @@ if ADMIN_USER_ID:
         ADMIN_USER_ID = int(ADMIN_USER_ID)
     except ValueError:
         ADMIN_USER_ID = None
-        logger.warning("ADMIN_USER_ID должен быть числом")
 else:
     ADMIN_USER_ID = None
 
 WHITELIST_ENABLED = os.environ.get("WHITELIST_ENABLED", "false").lower() == "true"
 
-# ---------- Выбор базы данных (PostgreSQL или SQLite) ----------
+# ---------- Database ----------
 DATABASE_URL = os.environ.get("DATABASE_URL")
 USE_POSTGRES = False
 conn_pool = None
@@ -58,17 +57,15 @@ if PSYCOPG2_AVAILABLE and DATABASE_URL:
     USE_POSTGRES = True
     try:
         conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
-        logger.info("PostgreSQL пул соединений создан")
+        logger.info("PostgreSQL connection pool created")
     except Exception as e:
-        logger.error(f"Ошибка подключения к PostgreSQL: {e}. Будет использован SQLite.")
+        logger.error(f"PostgreSQL connection failed: {e}. Falling back to SQLite.")
         USE_POSTGRES = False
 
-# Функции для получения/возврата соединения
 def get_db_conn():
     if USE_POSTGRES:
         return conn_pool.getconn()
     else:
-        import sqlite3
         return sqlite3.connect("logs.db")
 
 def put_db_conn(conn):
@@ -77,12 +74,37 @@ def put_db_conn(conn):
     else:
         conn.close()
 
-# ---------- Инициализация таблиц (BIGINT для PostgreSQL) ----------
 def init_db():
+    """Create tables and fix column types for PostgreSQL (BIGINT for user_id)."""
     if USE_POSTGRES:
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute('''
+        # Check if whitelist exists and its user_id type
+        cur.execute("""
+            SELECT data_type FROM information_schema.columns
+            WHERE table_name='whitelist' AND column_name='user_id'
+        """)
+        row = cur.fetchone()
+        if row and row[0] != 'bigint':
+            logger.warning("user_id column in whitelist has wrong type, recreating table...")
+            cur.execute("DROP TABLE whitelist CASCADE")
+            cur.execute("""
+                CREATE TABLE whitelist (
+                    user_id BIGINT PRIMARY KEY,
+                    added_by BIGINT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    user_id BIGINT PRIMARY KEY,
+                    added_by BIGINT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        # Telegram logs table
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS telegram_logs (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -91,8 +113,9 @@ def init_db():
                 bot_response TEXT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
-        cur.execute('''
+        """)
+        # Web logs table
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS web_logs (
                 id SERIAL PRIMARY KEY,
                 ip_address TEXT,
@@ -101,22 +124,23 @@ def init_db():
                 site_response TEXT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS whitelist (
+        """)
+        # Moderators table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS moderators (
                 user_id BIGINT PRIMARY KEY,
                 added_by BIGINT,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
+        """)
         conn.commit()
         cur.close()
         put_db_conn(conn)
-        logger.info("Таблицы PostgreSQL созданы/проверены (BIGINT)")
+        logger.info("PostgreSQL tables ready (BIGINT fixed).")
     else:
-        import sqlite3
+        # SQLite fallback
         with sqlite3.connect("logs.db") as conn:
-            conn.execute('''
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS telegram_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -125,8 +149,8 @@ def init_db():
                     bot_response TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
-            conn.execute('''
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS web_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ip_address TEXT,
@@ -135,18 +159,25 @@ def init_db():
                     site_response TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
-            conn.execute('''
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS whitelist (
                     user_id INTEGER PRIMARY KEY,
                     added_by INTEGER,
                     added_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS moderators (
+                    user_id INTEGER PRIMARY KEY,
+                    added_by INTEGER,
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.commit()
-        logger.info("Таблицы SQLite созданы/проверены")
+        logger.info("SQLite tables ready.")
 
-# ---------- Функции логирования ----------
+# ---------- Database helpers ----------
 def log_telegram(user_id: int, username: str, msg: str, bot_resp: str):
     conn = get_db_conn()
     try:
@@ -187,7 +218,6 @@ def log_web(ip: str, code: str, mods: str, resp: str):
     finally:
         put_db_conn(conn)
 
-# ---------- Белый список ----------
 def is_whitelisted(user_id: int) -> bool:
     if not WHITELIST_ENABLED:
         return True
@@ -218,7 +248,7 @@ def add_to_whitelist(user_id: int, added_by: int) -> bool:
             conn.commit()
         return True
     except Exception as e:
-        logger.error(f"Ошибка добавления в whitelist: {e}")
+        logger.error(f"Add to whitelist error: {e}")
         return False
     finally:
         put_db_conn(conn)
@@ -236,7 +266,7 @@ def remove_from_whitelist(user_id: int) -> bool:
             conn.commit()
         return True
     except Exception as e:
-        logger.error(f"Ошибка удаления из whitelist: {e}")
+        logger.error(f"Remove from whitelist error: {e}")
         return False
     finally:
         put_db_conn(conn)
@@ -257,7 +287,74 @@ def get_whitelist():
     finally:
         put_db_conn(conn)
 
-# ---------- FastAPI приложение ----------
+def is_moderator(user_id: int) -> bool:
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM moderators WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            cur.close()
+        else:
+            cur = conn.execute("SELECT 1 FROM moderators WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+        return row is not None
+    finally:
+        put_db_conn(conn)
+
+def add_moderator(user_id: int, added_by: int) -> bool:
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO moderators (user_id, added_by) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, added_by))
+            conn.commit()
+            cur.close()
+        else:
+            conn.execute("INSERT OR IGNORE INTO moderators (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Add moderator error: {e}")
+        return False
+    finally:
+        put_db_conn(conn)
+
+def remove_moderator(user_id: int) -> bool:
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM moderators WHERE user_id = %s", (user_id,))
+            conn.commit()
+            cur.close()
+        else:
+            conn.execute("DELETE FROM moderators WHERE user_id = ?", (user_id,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Remove moderator error: {e}")
+        return False
+    finally:
+        put_db_conn(conn)
+
+def get_moderators():
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT user_id, added_by, added_at FROM moderators ORDER BY added_at")
+            rows = cur.fetchall()
+            cur.close()
+            return [{"user_id": r[0], "added_by": r[1], "added_at": r[2]} for r in rows]
+        else:
+            cur = conn.execute("SELECT user_id, added_by, added_at FROM moderators ORDER BY added_at")
+            rows = cur.fetchall()
+            return [{"user_id": r[0], "added_by": r[1], "added_at": r[2]} for r in rows]
+    finally:
+        put_db_conn(conn)
+
+# ---------- FastAPI app ----------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -311,7 +408,7 @@ async def log_web_action(log: WebActionLog, req: Request):
     return {"status": "ok"}
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_panel(auth: bool = Depends(verify_auth)):
+async def admin_panel(auth=Depends(verify_auth)):
     try:
         with open("admin.html", "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
@@ -319,7 +416,7 @@ async def admin_panel(auth: bool = Depends(verify_auth)):
         raise HTTPException(500, "admin.html not found")
 
 @app.get("/api/telegram-logs")
-async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = None, username: str = None):
+async def get_telegram_logs(auth=Depends(verify_auth), user_id: int = None, username: str = None):
     conn = get_db_conn()
     try:
         if USE_POSTGRES:
@@ -338,7 +435,6 @@ async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = No
             cur.close()
             return [{"id": r[0], "user_id": r[1], "username": r[2], "message": r[3], "bot_response": r[4], "timestamp": r[5]} for r in rows]
         else:
-            import sqlite3
             conn.row_factory = sqlite3.Row
             query = "SELECT * FROM telegram_logs"
             params = []
@@ -355,7 +451,7 @@ async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = No
         put_db_conn(conn)
 
 @app.get("/api/web-logs")
-async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
+async def get_web_logs(auth=Depends(verify_auth), ip: str = None):
     conn = get_db_conn()
     try:
         if USE_POSTGRES:
@@ -368,7 +464,6 @@ async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
             cur.close()
             return [{"id": r[0], "ip_address": r[1], "entered_code": r[2], "uploaded_mods": r[3], "site_response": r[4], "timestamp": r[5]} for r in rows]
         else:
-            import sqlite3
             conn.row_factory = sqlite3.Row
             if ip:
                 rows = conn.execute("SELECT * FROM web_logs WHERE ip_address = ? ORDER BY timestamp DESC", (ip,)).fetchall()
@@ -378,7 +473,7 @@ async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
     finally:
         put_db_conn(conn)
 
-# ---------- Telegram бот ----------
+# ---------- Telegram bot ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     response = "👋 Привет! Я бот для выдачи одноразовых кодов.\nНапиши /getcode"
@@ -403,6 +498,59 @@ def is_admin(update: Update) -> bool:
     if not ADMIN_USER_ID:
         return False
     return update.effective_user.id == ADMIN_USER_ID
+
+def can_manage_whitelist(update: Update) -> bool:
+    user_id = update.effective_user.id
+    return is_admin(update) or is_moderator(user_id)
+
+# ---------- Admin & moderator commands ----------
+async def make_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Только главный администратор может назначать модераторов.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажите user_id: /make_moderator 123456789")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+    if add_moderator(uid, update.effective_user.id):
+        await update.message.reply_text(f"✅ Пользователь `{uid}` теперь модератор.", parse_mode="Markdown")
+        log_telegram(update.effective_user.id, update.effective_user.username, f"/make_moderator {uid}", "OK")
+    else:
+        await update.message.reply_text("❌ Ошибка при назначении модератора.")
+
+async def remove_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Только главный администратор может удалять модераторов.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажите user_id: /remove_moderator 123456789")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+    if remove_moderator(uid):
+        await update.message.reply_text(f"✅ Пользователь `{uid}` больше не модератор.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Ошибка при удалении модератора.")
+
+async def list_moderators(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    mods = get_moderators()
+    if not mods:
+        await update.message.reply_text("Список модераторов пуст.")
+        return
+    msg = "👥 **Модераторы:**\n\n"
+    for m in mods:
+        msg += f"• `{m['user_id']}` (добавлен {m['added_at']})\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -575,13 +723,13 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=f"📢 *Объявление:* {text}", parse_mode="Markdown")
             sent += 1
         except Exception as e:
-            logger.error(f"Не удалось отправить {uid}: {e}")
+            logger.error(f"Failed to send to {uid}: {e}")
             failed += 1
         await asyncio.sleep(0.05)
     await update.message.reply_text(f"Рассылка завершена: отправлено {sent}, ошибок {failed}.")
 
 async def whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    if not can_manage_whitelist(update):
         await update.message.reply_text("❌ Нет прав.")
         return
     users = get_whitelist()
@@ -594,7 +742,7 @@ async def whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def whitelist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    if not can_manage_whitelist(update):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
@@ -607,11 +755,12 @@ async def whitelist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if add_to_whitelist(uid, update.effective_user.id):
         await update.message.reply_text(f"✅ Пользователь `{uid}` добавлен в белый список.", parse_mode="Markdown")
+        log_telegram(update.effective_user.id, update.effective_user.username, f"/whitelist_add {uid}", "OK")
     else:
         await update.message.reply_text("❌ Ошибка при добавлении.")
 
 async def whitelist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    if not can_manage_whitelist(update):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
@@ -624,6 +773,7 @@ async def whitelist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if remove_from_whitelist(uid):
         await update.message.reply_text(f"✅ Пользователь `{uid}` удалён из белого списка.", parse_mode="Markdown")
+        log_telegram(update.effective_user.id, update.effective_user.username, f"/whitelist_remove {uid}", "OK")
     else:
         await update.message.reply_text("❌ Ошибка при удалении.")
 
@@ -633,15 +783,18 @@ async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = (
         "🤖 **Доступные команды администратора:**\n\n"
-        "/stats – Статистика использования бота и сайта\n"
+        "/stats – Статистика\n"
         "/logs [N] – Последние N логов Telegram\n"
         "/web_logs [N] – Последние N логов сайта\n"
-        "/user_logs <ID> – Логи конкретного пользователя\n"
-        "/broadcast <текст> – Массовая рассылка всем пользователям\n"
+        "/user_logs <ID> – Логи пользователя\n"
+        "/broadcast <текст> – Массовая рассылка\n"
         "/whitelist – Показать белый список\n"
-        "/whitelist_add <ID> – Добавить в белый список\n"
-        "/whitelist_remove <ID> – Удалить из белого списка\n"
-        "/list – Показать это сообщение\n"
+        "/whitelist_add <ID> – Добавить в белый список (админ/модератор)\n"
+        "/whitelist_remove <ID> – Удалить из белого списка (админ/модератор)\n"
+        "/make_moderator <ID> – Назначить модератора (только админ)\n"
+        "/remove_moderator <ID> – Удалить модератора (только админ)\n"
+        "/list_moderators – Список модераторов (только админ)\n"
+        "/list – Это сообщение\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -650,15 +803,15 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_text = update.message.text
     log_telegram(user.id, user.username, msg_text, "(неизвестная команда, ответ не отправлен)")
 
-# ---------- Вебхук и запуск бота ----------
+# ---------- Webhook and startup ----------
 async def setup_webhook(application: Application):
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
-        logger.error("RENDER_EXTERNAL_URL не задан")
+        logger.error("RENDER_EXTERNAL_URL not set")
         return False
     full_url = f"{render_url}/webhook"
     await application.bot.set_webhook(url=full_url)
-    logger.info(f"Вебхук установлен на {full_url}")
+    logger.info(f"Webhook set to {full_url}")
     return True
 
 bot_app = None
@@ -668,12 +821,9 @@ async def startup():
     global bot_app
     init_db()
     bot_app = Application.builder().token(BOT_TOKEN).build()
-    # Общие команды
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("getcode", get_code))
-    # Логирование всех текстовых сообщений
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    # Админ-команды
     if ADMIN_USER_ID:
         bot_app.add_handler(CommandHandler("stats", stats))
         bot_app.add_handler(CommandHandler("logs", logs))
@@ -683,14 +833,17 @@ async def startup():
         bot_app.add_handler(CommandHandler("whitelist", whitelist_cmd))
         bot_app.add_handler(CommandHandler("whitelist_add", whitelist_add))
         bot_app.add_handler(CommandHandler("whitelist_remove", whitelist_remove))
+        bot_app.add_handler(CommandHandler("make_moderator", make_moderator))
+        bot_app.add_handler(CommandHandler("remove_moderator", remove_moderator))
+        bot_app.add_handler(CommandHandler("list_moderators", list_moderators))
         bot_app.add_handler(CommandHandler("list", list_commands))
-        logger.info(f"Админ-команды включены для user_id={ADMIN_USER_ID}")
+        logger.info(f"Admin commands enabled for user_id={ADMIN_USER_ID}")
     else:
-        logger.warning("Админ-команды отключены (ADMIN_USER_ID не задан)")
+        logger.warning("Admin commands disabled (ADMIN_USER_ID not set)")
     await bot_app.initialize()
     await bot_app.start()
     await setup_webhook(bot_app)
-    logger.info("Бот запущен")
+    logger.info("Bot started")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -698,7 +851,7 @@ async def shutdown():
     if bot_app:
         await bot_app.stop()
         await bot_app.shutdown()
-        logger.info("Бот остановлен")
+        logger.info("Bot stopped")
 
 @app.post("/webhook")
 async def webhook(request: Request):
