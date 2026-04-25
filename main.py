@@ -13,20 +13,19 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import secrets
 
-# ---- Попытка импорта PostgreSQL, если не получится – используем SQLite ----
+# PostgreSQL поддержка (если доступен psycopg2 и задана DATABASE_URL)
 try:
     import psycopg2
     from psycopg2 import pool
-    USE_POSTGRES = True
-    logging.info("Будет использована PostgreSQL БД")
+    PSYCOPG2_AVAILABLE = True
 except ImportError:
-    import sqlite3
-    USE_POSTGRES = False
-    logging.info("Будет использована SQLite БД")
+    PSYCOPG2_AVAILABLE = False
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------- Конфигурация из переменных окружения ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан")
@@ -44,207 +43,221 @@ if ADMIN_USER_ID:
         ADMIN_USER_ID = int(ADMIN_USER_ID)
     except ValueError:
         ADMIN_USER_ID = None
+        logger.warning("ADMIN_USER_ID должен быть числом")
 else:
     ADMIN_USER_ID = None
 
 WHITELIST_ENABLED = os.environ.get("WHITELIST_ENABLED", "false").lower() == "true"
 
-# ---- Настройка подключения к БД ----
+# ---------- Выбор базы данных (PostgreSQL или SQLite) ----------
 DATABASE_URL = os.environ.get("DATABASE_URL")
-if USE_POSTGRES and DATABASE_URL:
-    # PostgreSQL
-    conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
-    def get_db_connection():
-        return conn_pool.getconn()
-    def put_db_connection(conn):
-        conn_pool.putconn(conn)
-    logger.info("PostgreSQL пул соединений создан")
-else:
-    # SQLite fallback
-    USE_POSTGRES = False
-    DATABASE_URL = "logs.db"
-    logger.info("Используется SQLite (локальный файл)")
+USE_POSTGRES = False
+conn_pool = None
 
-# ---- Инициализация таблиц ----
-def init_db():
+if PSYCOPG2_AVAILABLE and DATABASE_URL:
+    USE_POSTGRES = True
+    try:
+        conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+        logger.info("PostgreSQL пул соединений создан")
+    except Exception as e:
+        logger.error(f"Ошибка подключения к PostgreSQL: {e}. Будет использован SQLite.")
+        USE_POSTGRES = False
+
+# Функции для получения/возврата соединения
+def get_db_conn():
     if USE_POSTGRES:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS telegram_logs (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            message TEXT,
-            bot_response TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS web_logs (
-            id SERIAL PRIMARY KEY,
-            ip_address TEXT,
-            entered_code TEXT,
-            uploaded_mods TEXT,
-            site_response TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS whitelist (
-            user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        conn.commit()
-        cur.close()
-        put_db_connection(conn)
+        return conn_pool.getconn()
     else:
         import sqlite3
-        with sqlite3.connect(DATABASE_URL) as conn:
-            conn.execute('''
+        return sqlite3.connect("logs.db")
+
+def put_db_conn(conn):
+    if USE_POSTGRES:
+        conn_pool.putconn(conn)
+    else:
+        conn.close()
+
+# ---------- Инициализация таблиц (BIGINT для PostgreSQL) ----------
+def init_db():
+    if USE_POSTGRES:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS telegram_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 username TEXT,
                 message TEXT,
                 bot_response TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            ''')
-            conn.execute('''
+        ''')
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS web_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 ip_address TEXT,
                 entered_code TEXT,
                 uploaded_mods TEXT,
                 site_response TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            ''')
-            conn.execute('''
+        ''')
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS whitelist (
-                user_id INTEGER PRIMARY KEY,
-                added_by INTEGER,
-                added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                user_id BIGINT PRIMARY KEY,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            ''')
-            conn.commit()
-    logger.info("База данных инициализирована")
-
-# ---- Функции логирования (универсальные) ----
-def log_telegram(user_id: int, username: str, msg: str, bot_resp: str):
-    if USE_POSTGRES:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO telegram_logs (user_id, username, message, bot_response, timestamp) VALUES (%s, %s, %s, %s, %s)",
-            (user_id, username, msg, bot_resp, datetime.now())
-        )
+        ''')
         conn.commit()
         cur.close()
-        put_db_connection(conn)
+        put_db_conn(conn)
+        logger.info("Таблицы PostgreSQL созданы/проверены (BIGINT)")
     else:
         import sqlite3
-        with sqlite3.connect(DATABASE_URL) as conn:
+        with sqlite3.connect("logs.db") as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS telegram_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    message TEXT,
+                    bot_response TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS web_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip_address TEXT,
+                    entered_code TEXT,
+                    uploaded_mods TEXT,
+                    site_response TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    user_id INTEGER PRIMARY KEY,
+                    added_by INTEGER,
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+        logger.info("Таблицы SQLite созданы/проверены")
+
+# ---------- Функции логирования ----------
+def log_telegram(user_id: int, username: str, msg: str, bot_resp: str):
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO telegram_logs (user_id, username, message, bot_response, timestamp) VALUES (%s, %s, %s, %s, %s)",
+                (user_id, username, msg, bot_resp, datetime.now())
+            )
+            conn.commit()
+            cur.close()
+        else:
             conn.execute(
                 "INSERT INTO telegram_logs (user_id, username, message, bot_response, timestamp) VALUES (?, ?, ?, ?, ?)",
                 (user_id, username, msg, bot_resp, datetime.now())
             )
             conn.commit()
+    finally:
+        put_db_conn(conn)
 
 def log_web(ip: str, code: str, mods: str, resp: str):
-    if USE_POSTGRES:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (%s, %s, %s, %s, %s)",
-            (ip, code, mods, resp, datetime.now())
-        )
-        conn.commit()
-        cur.close()
-        put_db_connection(conn)
-    else:
-        import sqlite3
-        with sqlite3.connect(DATABASE_URL) as conn:
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (%s, %s, %s, %s, %s)",
+                (ip, code, mods, resp, datetime.now())
+            )
+            conn.commit()
+            cur.close()
+        else:
             conn.execute(
                 "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (?, ?, ?, ?, ?)",
                 (ip, code, mods, resp, datetime.now())
             )
             conn.commit()
+    finally:
+        put_db_conn(conn)
 
+# ---------- Белый список ----------
 def is_whitelisted(user_id: int) -> bool:
     if not WHITELIST_ENABLED:
         return True
-    if USE_POSTGRES:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM whitelist WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        put_db_connection(conn)
-        return row is not None
-    else:
-        import sqlite3
-        with sqlite3.connect(DATABASE_URL) as conn:
-            cur = conn.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,))
-            return cur.fetchone() is not None
-
-def add_to_whitelist(user_id: int, added_by: int) -> bool:
+    conn = get_db_conn()
     try:
         if USE_POSTGRES:
-            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM whitelist WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            cur.close()
+        else:
+            cur = conn.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+        return row is not None
+    finally:
+        put_db_conn(conn)
+
+def add_to_whitelist(user_id: int, added_by: int) -> bool:
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
             cur = conn.cursor()
             cur.execute("INSERT INTO whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, added_by))
             conn.commit()
             cur.close()
-            put_db_connection(conn)
         else:
-            import sqlite3
-            with sqlite3.connect(DATABASE_URL) as conn:
-                conn.execute("INSERT OR IGNORE INTO whitelist (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
-                conn.commit()
+            conn.execute("INSERT OR IGNORE INTO whitelist (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
+            conn.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка добавления в whitelist: {e}")
         return False
+    finally:
+        put_db_conn(conn)
 
 def remove_from_whitelist(user_id: int) -> bool:
+    conn = get_db_conn()
     try:
         if USE_POSTGRES:
-            conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("DELETE FROM whitelist WHERE user_id = %s", (user_id,))
             conn.commit()
             cur.close()
-            put_db_connection(conn)
         else:
-            import sqlite3
-            with sqlite3.connect(DATABASE_URL) as conn:
-                conn.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
-                conn.commit()
+            conn.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
+            conn.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка удаления из whitelist: {e}")
         return False
+    finally:
+        put_db_conn(conn)
 
 def get_whitelist():
-    if USE_POSTGRES:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at")
-        rows = cur.fetchall()
-        cur.close()
-        put_db_connection(conn)
-        return [{"user_id": r[0], "added_by": r[1], "added_at": r[2]} for r in rows]
-    else:
-        import sqlite3
-        with sqlite3.connect(DATABASE_URL) as conn:
-            rows = conn.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at").fetchall()
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at")
+            rows = cur.fetchall()
+            cur.close()
             return [{"user_id": r[0], "added_by": r[1], "added_at": r[2]} for r in rows]
+        else:
+            cur = conn.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at")
+            rows = cur.fetchall()
+            return [{"user_id": r[0], "added_by": r[1], "added_at": r[2]} for r in rows]
+    finally:
+        put_db_conn(conn)
 
-# ---- FASTRAPI (остальной код без изменений) ----
+# ---------- FastAPI приложение ----------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -307,26 +320,25 @@ async def admin_panel(auth: bool = Depends(verify_auth)):
 
 @app.get("/api/telegram-logs")
 async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = None, username: str = None):
-    if USE_POSTGRES:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        query = "SELECT * FROM telegram_logs"
-        params = []
-        if user_id:
-            query += " WHERE user_id = %s"
-            params.append(user_id)
-        elif username:
-            query += " WHERE username = %s"
-            params.append(username)
-        query += " ORDER BY timestamp DESC"
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        cur.close()
-        put_db_connection(conn)
-        return [{"id": r[0], "user_id": r[1], "username": r[2], "message": r[3], "bot_response": r[4], "timestamp": r[5]} for r in rows]
-    else:
-        import sqlite3
-        with sqlite3.connect(DATABASE_URL) as conn:
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            query = "SELECT * FROM telegram_logs"
+            params = []
+            if user_id:
+                query += " WHERE user_id = %s"
+                params.append(user_id)
+            elif username:
+                query += " WHERE username = %s"
+                params.append(username)
+            query += " ORDER BY timestamp DESC"
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            cur.close()
+            return [{"id": r[0], "user_id": r[1], "username": r[2], "message": r[3], "bot_response": r[4], "timestamp": r[5]} for r in rows]
+        else:
+            import sqlite3
             conn.row_factory = sqlite3.Row
             query = "SELECT * FROM telegram_logs"
             params = []
@@ -339,31 +351,34 @@ async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = No
             query += " ORDER BY timestamp DESC"
             rows = conn.execute(query, params).fetchall()
             return [dict(row) for row in rows]
+    finally:
+        put_db_conn(conn)
 
 @app.get("/api/web-logs")
 async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
-    if USE_POSTGRES:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        if ip:
-            cur.execute("SELECT * FROM web_logs WHERE ip_address = %s ORDER BY timestamp DESC", (ip,))
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            if ip:
+                cur.execute("SELECT * FROM web_logs WHERE ip_address = %s ORDER BY timestamp DESC", (ip,))
+            else:
+                cur.execute("SELECT * FROM web_logs ORDER BY timestamp DESC")
+            rows = cur.fetchall()
+            cur.close()
+            return [{"id": r[0], "ip_address": r[1], "entered_code": r[2], "uploaded_mods": r[3], "site_response": r[4], "timestamp": r[5]} for r in rows]
         else:
-            cur.execute("SELECT * FROM web_logs ORDER BY timestamp DESC")
-        rows = cur.fetchall()
-        cur.close()
-        put_db_connection(conn)
-        return [{"id": r[0], "ip_address": r[1], "entered_code": r[2], "uploaded_mods": r[3], "site_response": r[4], "timestamp": r[5]} for r in rows]
-    else:
-        import sqlite3
-        with sqlite3.connect(DATABASE_URL) as conn:
+            import sqlite3
             conn.row_factory = sqlite3.Row
             if ip:
                 rows = conn.execute("SELECT * FROM web_logs WHERE ip_address = ? ORDER BY timestamp DESC", (ip,)).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM web_logs ORDER BY timestamp DESC").fetchall()
             return [dict(row) for row in rows]
+    finally:
+        put_db_conn(conn)
 
-# ==================== ТЕЛЕГРАМ БОТ ====================
+# ---------- Telegram бот ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     response = "👋 Привет! Я бот для выдачи одноразовых кодов.\nНапиши /getcode"
@@ -384,7 +399,6 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response, parse_mode="Markdown")
     log_telegram(user.id, user.username, "/getcode", response)
 
-# ==================== АДМИН-КОМАНДЫ ====================
 def is_admin(update: Update) -> bool:
     if not ADMIN_USER_ID:
         return False
@@ -394,12 +408,34 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ Нет прав.")
         return
-    with get_db() as conn:
-        users_count = conn.execute("SELECT COUNT(DISTINCT user_id) FROM telegram_logs").fetchone()[0]
-        codes_count = conn.execute("SELECT COUNT(*) FROM telegram_logs WHERE message = '/getcode'").fetchone()[0]
-        web_checks = conn.execute("SELECT COUNT(*) FROM web_logs WHERE uploaded_mods != ''").fetchone()[0]
-        logins = conn.execute("SELECT COUNT(*) FROM web_logs WHERE site_response = 'Доступ разрешён'").fetchone()[0]
-        whitelist_count = conn.execute("SELECT COUNT(*) FROM whitelist").fetchone()[0]
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(DISTINCT user_id) FROM telegram_logs")
+            users_count = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM telegram_logs WHERE message = '/getcode'")
+            codes_count = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM web_logs WHERE uploaded_mods != ''")
+            web_checks = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM web_logs WHERE site_response = 'Доступ разрешён'")
+            logins = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM whitelist")
+            whitelist_count = cur.fetchone()[0]
+            cur.close()
+        else:
+            cur = conn.execute("SELECT COUNT(DISTINCT user_id) FROM telegram_logs")
+            users_count = cur.fetchone()[0]
+            cur = conn.execute("SELECT COUNT(*) FROM telegram_logs WHERE message = '/getcode'")
+            codes_count = cur.fetchone()[0]
+            cur = conn.execute("SELECT COUNT(*) FROM web_logs WHERE uploaded_mods != ''")
+            web_checks = cur.fetchone()[0]
+            cur = conn.execute("SELECT COUNT(*) FROM web_logs WHERE site_response = 'Доступ разрешён'")
+            logins = cur.fetchone()[0]
+            cur = conn.execute("SELECT COUNT(*) FROM whitelist")
+            whitelist_count = cur.fetchone()[0]
+    finally:
+        put_db_conn(conn)
     msg = (
         f"📊 **Статистика**\n"
         f"👥 Пользователей в Telegram: {users_count}\n"
@@ -418,17 +454,25 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit = 10
     if context.args and context.args[0].isdigit():
         limit = int(context.args[0])
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT timestamp, user_id, username, message, bot_response FROM telegram_logs ORDER BY timestamp DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT timestamp, user_id, username, message, bot_response FROM telegram_logs ORDER BY timestamp DESC LIMIT %s", (limit,))
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            rows = conn.execute("SELECT timestamp, user_id, username, message, bot_response FROM telegram_logs ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+    finally:
+        put_db_conn(conn)
     if not rows:
         await update.message.reply_text("Логов нет.")
         return
     msg = "📜 **Последние логи Telegram:**\n\n"
     for row in rows:
-        msg += f"🕒 {row['timestamp']}\n👤 {row['user_id']} (@{row['username'] or '?'})\n💬 {row['message']}\n🤖 {row['bot_response'][:100]}\n\n"
+        ts, uid, uname, msg_text, bot_resp = row[0], row[1], row[2], row[3], row[4]
+        uname = uname or '?'
+        msg += f"🕒 {ts}\n👤 {uid} (@{uname})\n💬 {msg_text}\n🤖 {bot_resp[:100]}\n\n"
         if len(msg) > 3800:
             await update.message.reply_text(msg)
             msg = ""
@@ -442,17 +486,24 @@ async def web_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit = 10
     if context.args and context.args[0].isdigit():
         limit = int(context.args[0])
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT timestamp, ip_address, entered_code, uploaded_mods, site_response FROM web_logs ORDER BY timestamp DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT timestamp, ip_address, entered_code, uploaded_mods, site_response FROM web_logs ORDER BY timestamp DESC LIMIT %s", (limit,))
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            rows = conn.execute("SELECT timestamp, ip_address, entered_code, uploaded_mods, site_response FROM web_logs ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+    finally:
+        put_db_conn(conn)
     if not rows:
         await update.message.reply_text("Логов сайта нет.")
         return
     msg = "🌐 **Последние логи сайта:**\n\n"
     for row in rows:
-        msg += f"🕒 {row['timestamp']}\n🌍 IP: {row['ip_address']}\n🔑 Код: {row['entered_code']}\n📦 Моды: {row['uploaded_mods'][:100]}\n📝 Ответ: {row['site_response']}\n\n"
+        ts, ip, code, mods, resp = row[0], row[1], row[2], row[3], row[4]
+        msg += f"🕒 {ts}\n🌍 IP: {ip}\n🔑 Код: {code}\n📦 Моды: {mods[:100]}\n📝 Ответ: {resp}\n\n"
         if len(msg) > 3800:
             await update.message.reply_text(msg)
             msg = ""
@@ -471,17 +522,24 @@ async def user_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("user_id должен быть числом.")
         return
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT timestamp, message, bot_response FROM telegram_logs WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20",
-            (uid,)
-        ).fetchall()
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT timestamp, message, bot_response FROM telegram_logs WHERE user_id = %s ORDER BY timestamp DESC LIMIT 20", (uid,))
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            rows = conn.execute("SELECT timestamp, message, bot_response FROM telegram_logs WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20", (uid,)).fetchall()
+    finally:
+        put_db_conn(conn)
     if not rows:
         await update.message.reply_text(f"Логов для пользователя {uid} не найдено.")
         return
     msg = f"📄 **Логи пользователя {uid}:**\n\n"
     for row in rows:
-        msg += f"🕒 {row['timestamp']}\n💬 {row['message']}\n🤖 {row['bot_response'][:100]}\n\n"
+        ts, msg_text, bot_resp = row[0], row[1], row[2]
+        msg += f"🕒 {ts}\n💬 {msg_text}\n🤖 {bot_resp[:100]}\n\n"
         if len(msg) > 3800:
             await update.message.reply_text(msg)
             msg = ""
@@ -493,18 +551,26 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
-        await update.message.reply_text("Укажите текст рассылки после команды.\nПример: /broadcast Всем привет!")
+        await update.message.reply_text("Укажите текст рассылки.\nПример: /broadcast Всем привет!")
         return
     text = " ".join(context.args)
-    with get_db() as conn:
-        users = conn.execute("SELECT DISTINCT user_id FROM telegram_logs").fetchall()
+    conn = get_db_conn()
+    try:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT user_id FROM telegram_logs")
+            users = cur.fetchall()
+            cur.close()
+        else:
+            users = conn.execute("SELECT DISTINCT user_id FROM telegram_logs").fetchall()
+    finally:
+        put_db_conn(conn)
     if not users:
         await update.message.reply_text("Нет пользователей для рассылки.")
         return
     sent = 0
     failed = 0
-    for row in users:
-        uid = row['user_id']
+    for (uid,) in users:
         try:
             await context.bot.send_message(chat_id=uid, text=f"📢 *Объявление:* {text}", parse_mode="Markdown")
             sent += 1
@@ -568,25 +634,23 @@ async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🤖 **Доступные команды администратора:**\n\n"
         "/stats – Статистика использования бота и сайта\n"
-        "/logs [N] – Последние N логов Telegram (по умолч. 10)\n"
+        "/logs [N] – Последние N логов Telegram\n"
         "/web_logs [N] – Последние N логов сайта\n"
         "/user_logs <ID> – Логи конкретного пользователя\n"
         "/broadcast <текст> – Массовая рассылка всем пользователям\n"
         "/whitelist – Показать белый список\n"
-        "/whitelist_add <ID> – Добавить пользователя в белый список\n"
+        "/whitelist_add <ID> – Добавить в белый список\n"
         "/whitelist_remove <ID> – Удалить из белого списка\n"
         "/list – Показать это сообщение\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# Обработчик всех остальных текстовых сообщений (логирование)
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg_text = update.message.text
     log_telegram(user.id, user.username, msg_text, "(неизвестная команда, ответ не отправлен)")
-    # Не отвечаем, чтобы не раздражать
 
-# ==================== ВЕБХУК И ЗАПУСК ====================
+# ---------- Вебхук и запуск бота ----------
 async def setup_webhook(application: Application):
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
@@ -607,7 +671,7 @@ async def startup():
     # Общие команды
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("getcode", get_code))
-    # Обработчик всех остальных текстовых сообщений (логирование)
+    # Логирование всех текстовых сообщений
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     # Админ-команды
     if ADMIN_USER_ID:
@@ -622,7 +686,7 @@ async def startup():
         bot_app.add_handler(CommandHandler("list", list_commands))
         logger.info(f"Админ-команды включены для user_id={ADMIN_USER_ID}")
     else:
-        logger.warning("Админ-команды отключены")
+        logger.warning("Админ-команды отключены (ADMIN_USER_ID не задан)")
     await bot_app.initialize()
     await bot_app.start()
     await setup_webhook(bot_app)
