@@ -1,7 +1,6 @@
 import os
 import random
 import logging
-import sqlite3
 import uuid
 import asyncio
 from datetime import datetime, timedelta
@@ -14,7 +13,17 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import secrets
 
-# ==================== НАСТРОЙКИ ====================
+# ---- Попытка импорта PostgreSQL, если не получится – используем SQLite ----
+try:
+    import psycopg2
+    from psycopg2 import pool
+    USE_POSTGRES = True
+    logging.info("Будет использована PostgreSQL БД")
+except ImportError:
+    import sqlite3
+    USE_POSTGRES = False
+    logging.info("Будет использована SQLite БД")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,80 +44,167 @@ if ADMIN_USER_ID:
         ADMIN_USER_ID = int(ADMIN_USER_ID)
     except ValueError:
         ADMIN_USER_ID = None
-        logger.warning("ADMIN_USER_ID должен быть числом")
 else:
     ADMIN_USER_ID = None
 
 WHITELIST_ENABLED = os.environ.get("WHITELIST_ENABLED", "false").lower() == "true"
 
-DATABASE_URL = "logs.db"
+# ---- Настройка подключения к БД ----
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if USE_POSTGRES and DATABASE_URL:
+    # PostgreSQL
+    conn_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+    def get_db_connection():
+        return conn_pool.getconn()
+    def put_db_connection(conn):
+        conn_pool.putconn(conn)
+    logger.info("PostgreSQL пул соединений создан")
+else:
+    # SQLite fallback
+    USE_POSTGRES = False
+    DATABASE_URL = "logs.db"
+    logger.info("Используется SQLite (локальный файл)")
 
-# ==================== БАЗА ДАННЫХ ====================
-def get_db():
-    conn = sqlite3.connect(DATABASE_URL)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# ---- Инициализация таблиц ----
 def init_db():
-    with get_db() as conn:
-        conn.execute('''
+    if USE_POSTGRES:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
         CREATE TABLE IF NOT EXISTS telegram_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL,
             username TEXT,
             message TEXT,
             bot_response TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
-        conn.execute('''
+        cur.execute('''
         CREATE TABLE IF NOT EXISTS web_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             ip_address TEXT,
             entered_code TEXT,
             uploaded_mods TEXT,
             site_response TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
-        conn.execute('''
+        cur.execute('''
         CREATE TABLE IF NOT EXISTS whitelist (
             user_id INTEGER PRIMARY KEY,
             added_by INTEGER,
-            added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
         conn.commit()
+        cur.close()
+        put_db_connection(conn)
+    else:
+        import sqlite3
+        with sqlite3.connect(DATABASE_URL) as conn:
+            conn.execute('''
+            CREATE TABLE IF NOT EXISTS telegram_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                message TEXT,
+                bot_response TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            conn.execute('''
+            CREATE TABLE IF NOT EXISTS web_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT,
+                entered_code TEXT,
+                uploaded_mods TEXT,
+                site_response TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            conn.execute('''
+            CREATE TABLE IF NOT EXISTS whitelist (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            conn.commit()
     logger.info("База данных инициализирована")
 
+# ---- Функции логирования (универсальные) ----
 def log_telegram(user_id: int, username: str, msg: str, bot_resp: str):
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO telegram_logs (user_id, username, message, bot_response, timestamp) VALUES (?, ?, ?, ?, ?)",
+    if USE_POSTGRES:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO telegram_logs (user_id, username, message, bot_response, timestamp) VALUES (%s, %s, %s, %s, %s)",
             (user_id, username, msg, bot_resp, datetime.now())
         )
         conn.commit()
+        cur.close()
+        put_db_connection(conn)
+    else:
+        import sqlite3
+        with sqlite3.connect(DATABASE_URL) as conn:
+            conn.execute(
+                "INSERT INTO telegram_logs (user_id, username, message, bot_response, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, msg, bot_resp, datetime.now())
+            )
+            conn.commit()
 
 def log_web(ip: str, code: str, mods: str, resp: str):
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (?, ?, ?, ?, ?)",
+    if USE_POSTGRES:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (%s, %s, %s, %s, %s)",
             (ip, code, mods, resp, datetime.now())
         )
         conn.commit()
+        cur.close()
+        put_db_connection(conn)
+    else:
+        import sqlite3
+        with sqlite3.connect(DATABASE_URL) as conn:
+            conn.execute(
+                "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (ip, code, mods, resp, datetime.now())
+            )
+            conn.commit()
 
 def is_whitelisted(user_id: int) -> bool:
     if not WHITELIST_ENABLED:
         return True
-    with get_db() as conn:
-        row = conn.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,)).fetchone()
+    if USE_POSTGRES:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM whitelist WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        put_db_connection(conn)
         return row is not None
+    else:
+        import sqlite3
+        with sqlite3.connect(DATABASE_URL) as conn:
+            cur = conn.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,))
+            return cur.fetchone() is not None
 
 def add_to_whitelist(user_id: int, added_by: int) -> bool:
     try:
-        with get_db() as conn:
-            conn.execute("INSERT OR IGNORE INTO whitelist (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
+        if USE_POSTGRES:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("INSERT INTO whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, added_by))
             conn.commit()
+            cur.close()
+            put_db_connection(conn)
+        else:
+            import sqlite3
+            with sqlite3.connect(DATABASE_URL) as conn:
+                conn.execute("INSERT OR IGNORE INTO whitelist (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
+                conn.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка добавления в whitelist: {e}")
@@ -116,20 +212,39 @@ def add_to_whitelist(user_id: int, added_by: int) -> bool:
 
 def remove_from_whitelist(user_id: int) -> bool:
     try:
-        with get_db() as conn:
-            conn.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
+        if USE_POSTGRES:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM whitelist WHERE user_id = %s", (user_id,))
             conn.commit()
+            cur.close()
+            put_db_connection(conn)
+        else:
+            import sqlite3
+            with sqlite3.connect(DATABASE_URL) as conn:
+                conn.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
+                conn.commit()
         return True
     except Exception as e:
         logger.error(f"Ошибка удаления из whitelist: {e}")
         return False
 
 def get_whitelist():
-    with get_db() as conn:
-        rows = conn.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at").fetchall()
-        return [dict(row) for row in rows]
+    if USE_POSTGRES:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at")
+        rows = cur.fetchall()
+        cur.close()
+        put_db_connection(conn)
+        return [{"user_id": r[0], "added_by": r[1], "added_at": r[2]} for r in rows]
+    else:
+        import sqlite3
+        with sqlite3.connect(DATABASE_URL) as conn:
+            rows = conn.execute("SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at").fetchall()
+            return [{"user_id": r[0], "added_by": r[1], "added_at": r[2]} for r in rows]
 
-# ==================== FASTAPI ====================
+# ---- FASTRAPI (остальной код без изменений) ----
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -179,12 +294,7 @@ async def health():
 @app.post("/api/log-web-action")
 async def log_web_action(log: WebActionLog, req: Request):
     client_ip = req.client.host
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO web_logs (ip_address, entered_code, uploaded_mods, site_response, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (client_ip, "", f"{log.mod_name} -> {log.verdict}", "OK", datetime.now())
-        )
-        conn.commit()
+    log_web(client_ip, "", f"{log.mod_name} -> {log.verdict}", "OK")
     return {"status": "ok"}
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -197,27 +307,61 @@ async def admin_panel(auth: bool = Depends(verify_auth)):
 
 @app.get("/api/telegram-logs")
 async def get_telegram_logs(auth: bool = Depends(verify_auth), user_id: int = None, username: str = None):
-    with get_db() as conn:
+    if USE_POSTGRES:
+        conn = get_db_connection()
+        cur = conn.cursor()
         query = "SELECT * FROM telegram_logs"
         params = []
         if user_id:
-            query += " WHERE user_id = ?"
+            query += " WHERE user_id = %s"
             params.append(user_id)
         elif username:
-            query += " WHERE username = ?"
+            query += " WHERE username = %s"
             params.append(username)
         query += " ORDER BY timestamp DESC"
-        rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        put_db_connection(conn)
+        return [{"id": r[0], "user_id": r[1], "username": r[2], "message": r[3], "bot_response": r[4], "timestamp": r[5]} for r in rows]
+    else:
+        import sqlite3
+        with sqlite3.connect(DATABASE_URL) as conn:
+            conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM telegram_logs"
+            params = []
+            if user_id:
+                query += " WHERE user_id = ?"
+                params.append(user_id)
+            elif username:
+                query += " WHERE username = ?"
+                params.append(username)
+            query += " ORDER BY timestamp DESC"
+            rows = conn.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
 
 @app.get("/api/web-logs")
 async def get_web_logs(auth: bool = Depends(verify_auth), ip: str = None):
-    with get_db() as conn:
+    if USE_POSTGRES:
+        conn = get_db_connection()
+        cur = conn.cursor()
         if ip:
-            rows = conn.execute("SELECT * FROM web_logs WHERE ip_address = ? ORDER BY timestamp DESC", (ip,)).fetchall()
+            cur.execute("SELECT * FROM web_logs WHERE ip_address = %s ORDER BY timestamp DESC", (ip,))
         else:
-            rows = conn.execute("SELECT * FROM web_logs ORDER BY timestamp DESC").fetchall()
-    return [dict(row) for row in rows]
+            cur.execute("SELECT * FROM web_logs ORDER BY timestamp DESC")
+        rows = cur.fetchall()
+        cur.close()
+        put_db_connection(conn)
+        return [{"id": r[0], "ip_address": r[1], "entered_code": r[2], "uploaded_mods": r[3], "site_response": r[4], "timestamp": r[5]} for r in rows]
+    else:
+        import sqlite3
+        with sqlite3.connect(DATABASE_URL) as conn:
+            conn.row_factory = sqlite3.Row
+            if ip:
+                rows = conn.execute("SELECT * FROM web_logs WHERE ip_address = ? ORDER BY timestamp DESC", (ip,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM web_logs ORDER BY timestamp DESC").fetchall()
+            return [dict(row) for row in rows]
 
 # ==================== ТЕЛЕГРАМ БОТ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
