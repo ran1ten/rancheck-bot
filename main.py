@@ -3,6 +3,7 @@ import random
 import logging
 import uuid
 import asyncio
+import aiohttp
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -125,6 +126,23 @@ def init_db():
             conn.execute("CREATE TABLE IF NOT EXISTS web_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ip_address TEXT, entered_code TEXT, uploaded_mods TEXT, site_response TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
             conn.execute("CREATE TABLE IF NOT EXISTS moderators (user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
         logger.info("SQLite tables ready")
+
+# ---------- Self-ping ----------
+async def self_ping():
+    """Every 5 minutes ping /health to keep Render from sleeping."""
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        logger.warning("RENDER_EXTERNAL_URL not set, self-ping disabled")
+        return
+    ping_url = f"{url}/health"
+    while True:
+        await asyncio.sleep(300)  # 5 minutes
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ping_url) as resp:
+                    logger.info(f"Self-ping: {resp.status}")
+        except Exception as e:
+            logger.error(f"Self-ping error: {e}")
 
 # ---------- Database helpers ----------
 def log_telegram(user_id: int, username: str, msg: str, bot_resp: str):
@@ -801,7 +819,9 @@ async def startup():
     await bot_app.initialize()
     await bot_app.start()
     await setup_webhook(bot_app)
-    logger.info("Bot started")
+    # Start self-ping
+    asyncio.create_task(self_ping())
+    logger.info("Bot started and self-ping loop running")
 
 @app.on_event("shutdown")
 async def shutdown():
