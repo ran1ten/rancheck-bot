@@ -788,21 +788,18 @@ async def remove_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not context.args:
         await update.message.reply_text("Укажите user_id: /remove_moderator 123456789")
-        log_telegram(user.id, user.username, "/remove_moderator", "Не указан user_id")
         return
     try:
         uid = int(context.args[0])
     except ValueError:
         await update.message.reply_text("user_id должен быть числом.")
-        log_telegram(user.id, user.username, "/remove_moderator", "Не число")
         return
     if remove_moderator(uid):
         await update.message.reply_text(f"✅ Пользователь `{uid}` больше не модератор.", parse_mode="Markdown")
         log_telegram(user.id, user.username, f"/remove_moderator {uid}", "OK")
     else:
         await update.message.reply_text("❌ Ошибка при удалении модератора.")
-        log_telegram(user.id, user.username, f"/remove_moderator {uid}", "Ошибка БД")
-
+        
 async def list_moderators(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(update):
